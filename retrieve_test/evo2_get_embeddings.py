@@ -4,7 +4,7 @@ import math
 import os
 import signal
 import sys
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 import torch
@@ -20,6 +20,51 @@ from tqdm.auto import tqdm
 #   -o embeddings/alcantar_2025/post_embeddings --batch_size 4
 
 LAYER_NAME = "blocks.31.mlp.l3"
+
+# Valid DNA/RNA characters (including IUPAC ambiguity codes)
+VALID_DNA_CHARS = set("ATCG")
+# Maximum sequence length to prevent OOM (adjust based on model context length)
+MAX_SEQUENCE_LENGTH = 1_000_000  # 1M context for evo2_7b
+MIN_SEQUENCE_LENGTH = 1
+
+
+def validate_sequence(sequence: str, seq_id: str = "") -> Tuple[bool, str]:
+    """
+    Validate a sequence for length and invalid characters.
+
+    Args:
+        sequence: DNA/RNA sequence to validate
+        seq_id: Optional sequence identifier for error messages
+
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    if not sequence:
+        return False, f"Empty sequence found{': ' + seq_id if seq_id else ''}"
+
+    seq_len = len(sequence)
+    if seq_len < MIN_SEQUENCE_LENGTH:
+        return False, (
+            f"Sequence too short (length {seq_len}, minimum {MIN_SEQUENCE_LENGTH})"
+            f"{': ' + seq_id if seq_id else ''}"
+        )
+
+    if seq_len > MAX_SEQUENCE_LENGTH:
+        return False, (
+            f"Sequence too long (length {seq_len}, maximum {MAX_SEQUENCE_LENGTH})"
+            f"{': ' + seq_id if seq_id else ''}"
+        )
+
+    # Check for invalid characters
+    sequence_upper = sequence.upper()
+    invalid_chars = set(sequence_upper) - VALID_DNA_CHARS
+    if invalid_chars:
+        return False, (
+            f"Invalid characters found: {sorted(invalid_chars)}"
+            f"{' in sequence: ' + seq_id if seq_id else ''}"
+        )
+
+    return True, ""
 
 
 def signal_handler(signum: int, frame) -> None:
@@ -59,9 +104,22 @@ def compute_log_likelihood(
         logprobs = torch.from_numpy(logprobs)
     logprobs = logprobs.float()
 
+    # Obtain the batch size (B) and effective number of tokens (T_eff) from the shape of logprobs.
     B, T_eff = logprobs.shape[:2]
+
+    # Ensure that the number of sequence lengths provided matches the batch size.
+    # If not, raise an error explaining the mismatch.
     if len(seq_lengths) != B:
         raise ValueError(f"seq_lengths size {len(seq_lengths)} != batch size {B}")
+
+    # Validate sequence lengths
+    for i, seq_len in enumerate(seq_lengths):
+        if seq_len < 0:
+            raise ValueError(f"Negative sequence length at index {i}: {seq_len}")
+        if seq_len > T_eff:
+            raise ValueError(
+                f"Sequence length {seq_len} at index {i} exceeds effective length {T_eff}"
+            )
 
     # Adjust lengths if BOS was prepended
     adj_lengths = [
@@ -97,17 +155,34 @@ def run_single_gpu(fasta_path: str, output_dir: str, batch_size: int) -> None:
     model.to(device)
     model.eval()
 
-    # Read FASTA data
+    # Read and validate FASTA data
     print(f"Reading FASTA file from {fasta_path}...", flush=True)
     sequences: List[str] = []
+    invalid_sequences: List[Tuple[str, str]] = []  # (seq_id, error_message)
+
     for record in SeqIO.parse(fasta_path, "fasta"):
-        sequences.append(str(record.seq))
+        seq_id = record.id
+        sequence = str(record.seq)
+        is_valid, error_msg = validate_sequence(sequence, seq_id)
+
+        if is_valid:
+            sequences.append(sequence)
+        else:
+            invalid_sequences.append((seq_id, error_msg))
+
+    # Report invalid sequences
+    if invalid_sequences:
+        print(f"Warning: Found {len(invalid_sequences)} invalid sequences:", flush=True)
+        for seq_id, error_msg in invalid_sequences[:10]:  # Show first 10
+            print(f"  - {seq_id}: {error_msg}", flush=True)
+        if len(invalid_sequences) > 10:
+            print(f"  ... and {len(invalid_sequences) - 10} more", flush=True)
 
     total_sequences = len(sequences)
     if total_sequences == 0:
-        print("No sequences found in FASTA file, exiting...", flush=True)
+        print("No valid sequences found in FASTA file, exiting...", flush=True)
         return
-    print(f"Total sequences: {total_sequences}", flush=True)
+    print(f"Total valid sequences: {total_sequences}", flush=True)
 
     # Storage for embeddings and log-likelihoods
     all_embeddings: list[torch.Tensor] = []
