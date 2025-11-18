@@ -7,8 +7,8 @@ import sys
 from typing import List
 
 import numpy as np
-import pandas as pd
 import torch
+from Bio import SeqIO
 from evo2 import Evo2
 from evo2.scoring import logits_to_logprobs, prepare_batch
 from safetensors.torch import save_file
@@ -82,7 +82,7 @@ def compute_log_likelihood(
     return torch.stack(results)
 
 
-def run_single_gpu(csv_path: str, output_dir: str, batch_size: int) -> None:
+def run_single_gpu(fasta_path: str, output_dir: str, batch_size: int) -> None:
     """Run Evo2 embedding and log-likelihood computation on a single GPU."""
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
@@ -97,28 +97,30 @@ def run_single_gpu(csv_path: str, output_dir: str, batch_size: int) -> None:
     model.to(device)
     model.eval()
 
-    # Read CSV data
-    print(f"Reading CSV data from {csv_path}...", flush=True)
-    df = pd.read_csv(csv_path)
-    total_rows = len(df)
-    if total_rows == 0:
-        print("No data found in CSV, exiting...", flush=True)
+    # Read FASTA data
+    print(f"Reading FASTA file from {fasta_path}...", flush=True)
+    sequences: List[str] = []
+    for record in SeqIO.parse(fasta_path, "fasta"):
+        sequences.append(str(record.seq))
+
+    total_sequences = len(sequences)
+    if total_sequences == 0:
+        print("No sequences found in FASTA file, exiting...", flush=True)
         return
-    print(f"Total rows: {total_rows}", flush=True)
+    print(f"Total sequences: {total_sequences}", flush=True)
 
     # Storage for embeddings and log-likelihoods
     all_embeddings: list[torch.Tensor] = []
     all_log_likelihoods: list[float] = []
 
-    num_batches = math.ceil(total_rows / batch_size)
+    num_batches = math.ceil(total_sequences / batch_size)
     print(f"Processing {num_batches} batches with batch size {batch_size}", flush=True)
 
     for batch_idx in tqdm(range(num_batches), desc="Processing batches"):
         batch_start = batch_idx * batch_size
-        batch_end = min(batch_start + batch_size, total_rows)
-        batch_df = df.iloc[batch_start:batch_end]
+        batch_end = min(batch_start + batch_size, total_sequences)
+        batch_sequences = sequences[batch_start:batch_end]
 
-        batch_sequences = batch_df["final_sequence"].tolist()
         if not batch_sequences:
             continue
 
@@ -166,10 +168,10 @@ def run_single_gpu(csv_path: str, output_dir: str, batch_size: int) -> None:
         return
 
     print(f"Saving {len(all_embeddings)} embeddings and log-likelihoods...", flush=True)
-    csv_basename = os.path.splitext(os.path.basename(csv_path))[0]
+    fasta_basename = os.path.splitext(os.path.basename(fasta_path))[0]
 
     # Save embeddings and log-likelihoods
-    safetensors_path = os.path.join(output_dir, f"{csv_basename}.safetensors")
+    safetensors_path = os.path.join(output_dir, f"{fasta_basename}.safetensors")
     save_file(
         {
             "embeddings": torch.stack(all_embeddings),
@@ -186,10 +188,10 @@ def main() -> None:
         description="Single-GPU Evo2 embedding computation"
     )
     parser.add_argument(
-        "--csv_path",
+        "--fasta_path",
         "-i",
         required=True,
-        help="Path to input CSV file (processed_chromatin_sequences.csv)",
+        help="Path to input FASTA file",
     )
     parser.add_argument(
         "--output_dir",
@@ -207,17 +209,17 @@ def main() -> None:
     args = parser.parse_args()
 
     # Validate paths
-    if not os.path.exists(args.csv_path):
-        parser.error(f"Input CSV file not found: {args.csv_path}")
+    if not os.path.exists(args.fasta_path):
+        parser.error(f"Input FASTA file not found: {args.fasta_path}")
 
     if not torch.cuda.is_available():
         parser.error("CUDA is not available. This script requires GPU support.")
 
-    print(f"Processing file: {args.csv_path}", flush=True)
+    print(f"Processing file: {args.fasta_path}", flush=True)
     print(f"Output directory: {args.output_dir}", flush=True)
     print(f"Batch size: {args.batch_size}", flush=True)
 
-    run_single_gpu(args.csv_path, args.output_dir, args.batch_size)
+    run_single_gpu(args.fasta_path, args.output_dir, args.batch_size)
 
 
 if __name__ == "__main__":
