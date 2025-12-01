@@ -1,5 +1,5 @@
 [project]
-name = "evo2"
+name = "evo2-embeddings"
 version = "0.3.0"
 description = "Genome modeling across all domains of life"
 readme = "README.md"
