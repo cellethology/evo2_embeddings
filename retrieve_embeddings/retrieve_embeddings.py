@@ -5,9 +5,11 @@ from typing import List, Tuple
 
 import numpy as np
 import torch
-from evo2 import Evo2
 from evo2.scoring import prepare_batch
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+
+from evo2 import Evo2
 
 from .util import (
     load_sequences_from_fasta,
@@ -21,7 +23,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-LAYER_NAME = "blocks.31.mlp.l3"
+LAYER_NAME = "blocks.28.mlp.l3"
+
+
+class SequenceDataset(Dataset):
+    def __init__(self, sequences: List[str], ids: List[str]):
+        self.sequences = sequences
+        self.ids = ids
+
+    def __len__(self) -> int:
+        return len(self.sequences)
+
+    def __getitem__(self, idx: int):
+        return self.sequences[idx], self.ids[idx]
+
+
+def _collate(batch):
+    seqs, ids = zip(*batch)
+    return list(seqs), list(ids)
+
+
+def prepare_model(model_name: str, device: str) -> Evo2:
+    """Load Evo2, move the underlying model to the device, and enable eval mode."""
+    logger.info(f"Loading Evo2 model: {model_name} on device {device}...")
+    model = Evo2(model_name=model_name)
+
+    base_model = getattr(model, "model", None)
+    if base_model is None:
+        raise AttributeError("Evo2 instance does not expose the underlying model")
+
+    base_model.to(device)
+    base_model.eval()
+    logger.info("Model loaded and ready for inference")
+    return model
 
 
 def extract_embeddings_batch(
@@ -55,12 +89,11 @@ def extract_embeddings_batch(
     )
 
     # Extract embeddings using forward pass
-    with torch.no_grad():
-        _, embeddings_dict = model.forward(
-            input_ids=input_ids,
-            return_embeddings=True,
-            layer_names=[layer_name],
-        )
+    _, embeddings_dict = model.forward(
+        input_ids=input_ids,
+        return_embeddings=True,
+        layer_names=[layer_name],
+    )
 
     embeddings = embeddings_dict[layer_name]
 
@@ -76,7 +109,7 @@ def process_sequences(
     layer_name: str = LAYER_NAME,
     device: str = "cuda:0",
     prepend_bos: bool = True,
-    mean_pooling: bool = False,
+    mean_pooling: bool = True,
 ) -> None:
     """
     Process sequences in batches and extract embeddings.
@@ -91,7 +124,7 @@ def process_sequences(
         device: Device to run inference on (default: "cuda:0")
         prepend_bos: Whether to prepend BOS token (default: True)
         mean_pooling: If True, average embeddings across sequence length to get a single
-            vector per sequence. Reduces memory usage significantly (default: False)
+            vector per sequence. Reduces memory usage significantly (default: True)
 
     Raises:
         ValueError: If sequences and sequence_ids have different lengths
@@ -107,23 +140,25 @@ def process_sequences(
         f"on device {device}"
     )
     if mean_pooling:
-        logger.info("Mean pooling enabled: embeddings will be averaged across sequence length")
+        logger.info(
+            "Mean pooling enabled: embeddings will be averaged across sequence length"
+        )
 
     # Lists to collect all embeddings and IDs
     all_ids: List[str] = []
     all_embeddings: List[np.ndarray] = []
 
-    # Process sequences in batches
-    num_batches = (len(sequences) + batch_size - 1) // batch_size
+    dataset = SequenceDataset(sequences, sequence_ids)
+    dataloader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=False, collate_fn=_collate
+    )
 
-    with tqdm(total=len(sequences), desc="Extracting embeddings") as pbar:
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(sequences))
+    failed_ids: List[str] = []
 
-            batch_sequences = sequences[start_idx:end_idx]
-            batch_ids = sequence_ids[start_idx:end_idx]
-
+    with torch.inference_mode():
+        for batch_sequences, batch_ids in tqdm(
+            dataloader, desc="Extracting embeddings", unit="batch"
+        ):
             try:
                 # Extract embeddings for the batch
                 batch_embeddings, batch_seq_lengths = extract_embeddings_batch(
@@ -135,10 +170,10 @@ def process_sequences(
                 )
 
                 # Extract embeddings for each sequence in the batch
-                for i, seq_id in enumerate(batch_ids):
+                batch_embeddings_np: List[np.ndarray] = []
+                for i, seq_length in enumerate(batch_seq_lengths):
                     # Extract embeddings for this specific sequence
                     # Note: embeddings are padded, so we need to extract the actual sequence length
-                    seq_length = batch_seq_lengths[i]
                     if prepend_bos:
                         # Skip BOS token if prepended (first position)
                         # Take seq_length tokens after BOS
@@ -147,25 +182,36 @@ def process_sequences(
                         # Take seq_length tokens from the start
                         seq_embeddings = batch_embeddings[i, :seq_length]
 
-                    # Apply mean pooling if requested (reduces memory usage)
+                    # Apply mean pooling
                     if mean_pooling:
-                        # Average across sequence length dimension: (seq_length, embedding_dim) -> (embedding_dim,)
                         seq_embeddings = torch.mean(seq_embeddings, dim=0)
 
-                    # Convert to numpy and store
-                    # Convert to float32 first to avoid BFloat16 issues with numpy
-                    all_ids.append(seq_id)
-                    all_embeddings.append(seq_embeddings.cpu().float().numpy())
+                    # Convert to numpy
+                    batch_embeddings_np.append(seq_embeddings.cpu().float().numpy())
 
-                pbar.update(len(batch_sequences))
+                all_embeddings.extend(batch_embeddings_np)
+                all_ids.extend(batch_ids)
 
             except Exception as e:
                 logger.error(
-                    f"Error processing batch {batch_idx + 1}/{num_batches}: {str(e)}"
+                    f"Error processing batch containing IDs {batch_ids}: {str(e)}",
+                    exc_info=True,
                 )
-                # Continue with next batch
-                pbar.update(len(batch_sequences))
+                failed_ids.extend(batch_ids)
                 continue
+
+    if failed_ids:
+        raise RuntimeError(
+            "Failed to process the following sequence IDs: "
+            f"{', '.join(failed_ids[:10])}"
+            f"{' ...' if len(failed_ids) > 10 else ''}"
+        )
+
+    if len(all_embeddings) != len(sequence_ids):
+        raise ValueError(
+            "Mismatch between embeddings and sequence IDs: "
+            f"{len(all_embeddings)} embeddings vs {len(sequence_ids)} ids"
+        )
 
     # Save all embeddings to a single .npz file
     logger.info(f"Saving {len(all_ids)} embeddings to {output_path}...")
@@ -268,8 +314,7 @@ def main() -> None:
         sequences, sequence_ids = load_sequences_from_fasta(args.fasta_path)
 
         # Initialize model
-        logger.info(f"Loading Evo2 model: {args.model_name}...")
-        model = Evo2(model_name=args.model_name)
+        model = prepare_model(args.model_name, args.device)
         logger.info("Model loaded successfully")
 
         # Process sequences and extract embeddings
