@@ -97,11 +97,23 @@ def extract_embeddings_batch(
     )
 
     embeddings = embeddings_dict[layer_name]
+
+    seq_len_idx = torch.tensor(seq_lengths, device=embeddings.device)
+    if prepend_bos:
+        seq_len_idx += 1  # last real token is shifted by the BOS token
     if final_token_only:
-        seq_len_idx = torch.tensor(seq_lengths, device=embeddings.device)
-        if prepend_bos:
-            seq_len_idx += 1  # last real token is shifted by the BOS token
         embeddings = embeddings[:, seq_len_idx - 1, :]
+    else:
+        bos_offset = 1 if prepend_bos else 0
+        max_len = int(seq_len_idx.max().item()) if seq_len_idx.numel() > 0 else 0
+
+        token_embeddings = embeddings[:, bos_offset : bos_offset + max_len, :]
+        mask = torch.arange(max_len, device=embeddings.device).unsqueeze(
+            0
+        ) < seq_len_idx.unsqueeze(1)
+        embeddings = (token_embeddings * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(
+            dim=1, keepdim=True
+        ).clamp_min(1)
 
     return embeddings, seq_lengths
 
@@ -165,7 +177,7 @@ def process_sequences(
         ):
             try:
                 # Extract embeddings for the batch
-                batch_embeddings, batch_seq_lengths = extract_embeddings_batch(
+                batch_embeddings, _ = extract_embeddings_batch(
                     model=model,
                     sequences=batch_sequences,
                     layer_name=layer_name,
@@ -174,32 +186,7 @@ def process_sequences(
                     final_token_only=final_token_only,
                 )
 
-                if final_token_only:
-                    batch_embeddings_np = batch_embeddings.cpu().float().numpy()
-                else:
-                    seq_lens = torch.tensor(
-                        batch_seq_lengths, device=batch_embeddings.device
-                    )
-                    bos_offset = 1 if prepend_bos else 0
-                    max_len = int(seq_lens.max().item()) if seq_lens.numel() > 0 else 0
-                    if max_len == 0:
-                        batch_embeddings_np = np.zeros(
-                            (len(batch_seq_lengths), batch_embeddings.shape[-1]),
-                            dtype=np.float32,
-                        )
-                    else:
-                        token_embeddings = batch_embeddings[
-                            :, bos_offset : bos_offset + max_len, :
-                        ]
-                        mask = torch.arange(
-                            max_len, device=batch_embeddings.device
-                        ).unsqueeze(0) < seq_lens.unsqueeze(1)
-                        pooled = (token_embeddings * mask.unsqueeze(-1)).sum(
-                            dim=1
-                        ) / mask.sum(dim=1, keepdim=True).clamp_min(1)
-                        batch_embeddings_np = pooled.cpu().float().numpy()
-
-                all_embeddings.extend(batch_embeddings_np)
+                all_embeddings.extend(batch_embeddings.cpu().float().numpy())
                 all_ids.extend(batch_ids)
 
             except Exception as e:
