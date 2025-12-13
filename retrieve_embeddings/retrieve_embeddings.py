@@ -103,7 +103,8 @@ def extract_embeddings_batch(
     if prepend_bos:
         seq_lens += 1  # last real token is shifted by the BOS token
     if final_token_only:
-        embeddings = embeddings[:, seq_lens - 1, :]
+        row_ids = torch.arange(embeddings.size(0), device=embeddings.device)
+        embeddings = embeddings[row_ids, seq_lens - 1, :]
     else:
         bos_offset = 1 if prepend_bos else 0
         token_embeddings = embeddings[:, bos_offset : bos_offset + max_seq_len, :]
