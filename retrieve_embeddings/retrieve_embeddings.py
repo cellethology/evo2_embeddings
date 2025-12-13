@@ -98,19 +98,18 @@ def extract_embeddings_batch(
 
     embeddings = embeddings_dict[layer_name]
 
-    seq_len_idx = torch.tensor(seq_lengths, device=embeddings.device)
+    seq_lens = torch.tensor(seq_lengths, device=embeddings.device)
+    max_seq_len = max(seq_lengths)
     if prepend_bos:
-        seq_len_idx += 1  # last real token is shifted by the BOS token
+        seq_lens += 1  # last real token is shifted by the BOS token
     if final_token_only:
-        embeddings = embeddings[:, seq_len_idx - 1, :]
+        embeddings = embeddings[:, seq_lens - 1, :]
     else:
         bos_offset = 1 if prepend_bos else 0
-        max_len = int(seq_len_idx.max().item()) if seq_len_idx.numel() > 0 else 0
-
-        token_embeddings = embeddings[:, bos_offset : bos_offset + max_len, :]
-        mask = torch.arange(max_len, device=embeddings.device).unsqueeze(
-            0
-        ) < seq_len_idx.unsqueeze(1)
+        token_embeddings = embeddings[:, bos_offset : bos_offset + max_seq_len, :]
+        mask = torch.arange(
+            token_embeddings.size(1), device=embeddings.device
+        ).unsqueeze(0) < seq_lens.unsqueeze(1)
         embeddings = (token_embeddings * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(
             dim=1, keepdim=True
         ).clamp_min(1)
