@@ -64,6 +64,7 @@ def extract_embeddings_batch(
     layer_name: str,
     device: str = "cuda:0",
     prepend_bos: bool = False,
+    final_token_only: bool = False,
 ) -> Tuple[torch.Tensor, List[int]]:
     """
     Extract embeddings for a batch of sequences.
@@ -74,7 +75,7 @@ def extract_embeddings_batch(
         layer_name: Name of the layer to extract embeddings from
         device: Device to run inference on (default: "cuda:0")
         prepend_bos: Whether to prepend BOS token (default: False)
-
+        final_token_only: Whether to return only the final token embedding (default: False)
     Returns:
         Tuple of (embeddings tensor, sequence_lengths list)
         Embeddings have shape [batch_size, max_seq_length + (1 if prepend_bos else 0), embedding_dim]
@@ -88,14 +89,19 @@ def extract_embeddings_batch(
         device=device,
     )
 
-    # Extract embeddings using forward pass
-    _, embeddings_dict = model.forward(
+    # Extract embeddings
+    _, embeddings_dict = model(
         input_ids=input_ids,
         return_embeddings=True,
         layer_names=[layer_name],
     )
 
     embeddings = embeddings_dict[layer_name]
+    if final_token_only:
+        seq_len_idx = torch.tensor(seq_lengths, device=embeddings.device)
+        if prepend_bos:
+            seq_len_idx += 1  # last real token is shifted by the BOS token
+        embeddings = embeddings[:, seq_len_idx - 1, :]
 
     return embeddings, seq_lengths
 
@@ -109,7 +115,7 @@ def process_sequences(
     layer_name: str = LAYER_NAME,
     device: str = "cuda:0",
     prepend_bos: bool = True,
-    mean_pooling: bool = True,
+    final_token_only: bool = False,
 ) -> None:
     """
     Process sequences in batches and extract embeddings.
@@ -123,9 +129,7 @@ def process_sequences(
         layer_name: Name of the layer to extract embeddings from (default: LAYER_NAME)
         device: Device to run inference on (default: "cuda:0")
         prepend_bos: Whether to prepend BOS token (default: True)
-        mean_pooling: If True, average embeddings across sequence length to get a single
-            vector per sequence. Reduces memory usage significantly (default: True)
-
+        final_token_only: If True, return only the final token embedding (default: False)
     Raises:
         ValueError: If sequences and sequence_ids have different lengths
     """
@@ -139,9 +143,9 @@ def process_sequences(
         f"Processing {len(sequences)} sequences in batches of {batch_size} "
         f"on device {device}"
     )
-    if mean_pooling:
+    if final_token_only:
         logger.info(
-            "Mean pooling enabled: embeddings will be averaged across sequence length"
+            "Final token only enabled: embeddings will be returned for the final token only"
         )
 
     # Lists to collect all embeddings and IDs
@@ -167,27 +171,33 @@ def process_sequences(
                     layer_name=layer_name,
                     device=device,
                     prepend_bos=prepend_bos,
+                    final_token_only=final_token_only,
                 )
 
-                # Extract embeddings for each sequence in the batch
-                batch_embeddings_np: List[np.ndarray] = []
-                for i, seq_length in enumerate(batch_seq_lengths):
-                    # Extract embeddings for this specific sequence
-                    # Note: embeddings are padded, so we need to extract the actual sequence length
-                    if prepend_bos:
-                        # Skip BOS token if prepended (first position)
-                        # Take seq_length tokens after BOS
-                        seq_embeddings = batch_embeddings[i, 1 : seq_length + 1]
+                if final_token_only:
+                    batch_embeddings_np = batch_embeddings.cpu().float().numpy()
+                else:
+                    seq_lens = torch.tensor(
+                        batch_seq_lengths, device=batch_embeddings.device
+                    )
+                    bos_offset = 1 if prepend_bos else 0
+                    max_len = int(seq_lens.max().item()) if seq_lens.numel() > 0 else 0
+                    if max_len == 0:
+                        batch_embeddings_np = np.zeros(
+                            (len(batch_seq_lengths), batch_embeddings.shape[-1]),
+                            dtype=np.float32,
+                        )
                     else:
-                        # Take seq_length tokens from the start
-                        seq_embeddings = batch_embeddings[i, :seq_length]
-
-                    # Apply mean pooling
-                    if mean_pooling:
-                        seq_embeddings = torch.mean(seq_embeddings, dim=0)
-
-                    # Convert to numpy
-                    batch_embeddings_np.append(seq_embeddings.cpu().float().numpy())
+                        token_embeddings = batch_embeddings[
+                            :, bos_offset : bos_offset + max_len, :
+                        ]
+                        mask = torch.arange(
+                            max_len, device=batch_embeddings.device
+                        ).unsqueeze(0) < seq_lens.unsqueeze(1)
+                        pooled = (token_embeddings * mask.unsqueeze(-1)).sum(
+                            dim=1
+                        ) / mask.sum(dim=1, keepdim=True).clamp_min(1)
+                        batch_embeddings_np = pooled.cpu().float().numpy()
 
                 all_embeddings.extend(batch_embeddings_np)
                 all_ids.extend(batch_ids)
@@ -279,10 +289,9 @@ def main() -> None:
         help="Prepend BOS token to sequences (default: False)",
     )
     parser.add_argument(
-        "--mean_pooling",
+        "--final_token_only",
         action="store_true",
-        help="Apply mean pooling to embeddings across sequence length. "
-        "Reduces memory usage by averaging per-token embeddings into a single vector per sequence (default: False)",
+        help="Return only the final token embedding (default: False)",
     )
 
     args = parser.parse_args()
@@ -327,7 +336,7 @@ def main() -> None:
             layer_name=args.layer_name,
             device=args.device,
             prepend_bos=args.prepend_bos,
-            mean_pooling=args.mean_pooling,
+            final_token_only=args.final_token_only,
         )
 
         logger.info("Embedding extraction completed successfully")

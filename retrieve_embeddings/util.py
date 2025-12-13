@@ -119,7 +119,7 @@ def save_embeddings_to_npz(
 
     Args:
         ids: List of sequence identifiers
-        embeddings: List of embedding arrays (one per sequence)
+    embeddings: List of embedding arrays (one per sequence)
         output_path: Path to save the .npz file
 
     Raises:
@@ -149,4 +149,3 @@ def save_embeddings_to_npz(
     np.savez_compressed(output_path, ids=ids_array, embeddings=embeddings_array)
 
     logger.info(f"Saved {len(ids)} embeddings to {output_path}")
-
