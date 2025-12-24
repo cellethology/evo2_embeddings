@@ -23,7 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-LAYER_NAME = "blocks.28.mlp.l3"
+LAYER_NAME = "blocks.28"
 
 
 class SequenceDataset(Dataset):
@@ -123,7 +123,7 @@ def process_sequences(
     sequences: List[str],
     sequence_ids: List[str],
     output_path: str,
-    batch_size: int = 8,
+    batch_size: int = 1,
     layer_name: str = LAYER_NAME,
     device: str = "cuda:0",
     prepend_bos: bool = True,
@@ -137,7 +137,7 @@ def process_sequences(
         sequences: List of DNA sequences to process
         sequence_ids: List of sequence identifiers corresponding to sequences
         output_path: Path to save the .npz file with all embeddings
-        batch_size: Number of sequences to process per batch (default: 8)
+        batch_size: Number of sequences to process per batch (default: 1)
         layer_name: Name of the layer to extract embeddings from (default: LAYER_NAME)
         device: Device to run inference on (default: "cuda:0")
         prepend_bos: Whether to prepend BOS token (default: True)
@@ -246,8 +246,8 @@ def main() -> None:
         "--batch_size",
         "-b",
         type=int,
-        default=8,
-        help="Batch size for processing sequences (default: 8)",
+        default=1,
+        help="Batch size for processing sequences (default: 1)",
     )
     parser.add_argument(
         "--model_name",
